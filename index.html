@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rafter Load Visualiser</title>
+<meta name="description" content="Interactive rafter load calculator — live force paths and Eurocode 5 checks for shed and gable roofs." />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style> body { margin: 0; background: #fff; } </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+const GRADES = {
+  C18: { fmk: 18, fvk: 3.4, fc0k: 18, E: 9000 },
+  C24: { fmk: 24, fvk: 4.0, fc0k: 21, E: 11000 },
+  C30: { fmk: 30, fvk: 4.0, fc0k: 23, E: 12000 },
+};
+const DURATION = {
+  "Permanent (0.60)": 0.6,
+  "Long-term (0.70)": 0.7,
+  "Medium / snow (0.80)": 0.8,
+  "Short-term (0.90)": 0.9,
+  "Instant / wind (1.10)": 1.1,
+};
+const GAMMA_M = 1.4, KDEF = 0.8;
+const C = { load: "#2563eb", react: "#16a34a", thrust: "#dc2626", tie: "#0d9488", crown: "#7c3aed", axial: "#64748b" };
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const f = (v, d = 1) => (isFinite(v) ? Number(v).toFixed(d) : "—");
+const muSnow = (a) => (a <= 30 ? 0.8 : a < 60 ? (0.8 * (60 - a)) / 30 : 0);
+
+function Arrow({ x1, y1, x2, y2, color, width = 2 }) {
+  const ang = Math.atan2(y2 - y1, x2 - x1), hl = 7.5;
+  const p1 = [x2 + hl * Math.cos(ang + Math.PI - 0.42), y2 + hl * Math.sin(ang + Math.PI - 0.42)];
+  const p2 = [x2 + hl * Math.cos(ang + Math.PI + 0.42), y2 + hl * Math.sin(ang + Math.PI + 0.42)];
+  return (
+    <g>
+      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth={width} strokeLinecap="round" />
+      <polygon points={`${x2},${y2} ${p1[0]},${p1[1]} ${p2[0]},${p2[1]}`} fill={color} />
+    </g>
+  );
+}
+function Seg({ options, value, onChange }) {
+  return (
+    <div className="inline-flex flex-wrap rounded-lg bg-slate-200/70 p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.v}
+          onClick={() => onChange(o.v)}
+          className={`px-2.5 py-1 text-sm rounded-md transition ${
+            value === o.v ? "bg-white text-slate-900 shadow-sm font-medium" : "text-slate-600 hover:text-slate-900"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+function Slider({ label, value, set, min, max, step, unit }) {
+  return (
+    <div>
+      <div className="flex justify-between items-baseline mb-0.5">
+        <span className="text-sm text-slate-600">{label}</span>
+        <span className="font-mono text-sm text-slate-900">
+          {value}
+          <span className="text-slate-400 ml-0.5">{unit}</span>
+        </span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => set(parseFloat(e.target.value))} className="w-full accent-blue-600" />
+    </div>
+  );
+}
+function CheckRow({ label, demand, capacity, unit }) {
+  const util = capacity > 0 ? demand / capacity : 0;
+  const pass = util <= 1, barW = (Math.min(util, 1.3) / 1.3) * 100;
+  const bar = util > 1 ? "bg-red-500" : util > 0.85 ? "bg-amber-500" : "bg-green-500";
+  return (
+    <div className="py-1.5 border-b border-slate-100 last:border-0">
+      <div className="flex justify-between items-baseline text-sm">
+        <span className="text-slate-700">{label}</span>
+        <span className="font-mono text-slate-900 text-xs">
+          {f(demand, 2)} / {f(capacity, 2)} <span className="text-slate-400">{unit}</span>
+        </span>
+      </div>
+      <div className="flex items-center gap-2 mt-1">
+        <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
+          <div className={`h-full ${bar} rounded-full transition-all`} style={{ width: `${barW}%` }} />
+        </div>
+        <span className={`font-mono text-xs w-11 text-right ${pass ? "text-green-700" : "text-red-700"}`}>
+          {f(util * 100, 0)}%
+        </span>
+        <span className={`text-xs font-medium w-10 text-center rounded px-1 py-0.5 ${pass ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}`}>
+          {pass ? "OK" : "FAIL"}
+        </span>
+      </div>
+    </div>
+  );
+}
+function Stat({ label, value, unit, color }) {
+  return (
+    <div className="bg-slate-50 rounded-lg px-2.5 py-1.5">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="font-mono text-sm text-slate-900" style={color ? { color } : {}}>
+        {value}<span className="text-slate-400 text-xs ml-0.5">{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function RafterCalculator() {
+  const [roof, setRoof] = useState("gable");
+  const [profile, setProfile] = useState("asym");
+  const [system, setSystem] = useState("coupled");
+  const [tie, setTie] = useState("plate");
+  const [collarPct, setCollarPct] = useState(45);
+  const [active, setActive] = useState("R");
+
+  const [span, setSpan] = useState(8);
+  const [pitch, setPitch] = useState(25);
+  const [pitchL, setPitchL] = useState(66);
+  const [pitchR, setPitchR] = useState(49);
+  const [spacing, setSpacing] = useState(0.9);
+  const [G, setG] = useState(0.5);
+  const [sk, setSk] = useState(2.5);
+  const [b, setB] = useState(48);
+  const [h, setH] = useState(223);
+  const [grade, setGrade] = useState("C24");
+  const [dur, setDur] = useState("Medium / snow (0.80)");
+
+  const r = useMemo(() => {
+    const g = GRADES[grade], kmod = DURATION[dur];
+    const isShed = roof === "shed";
+    const asym = roof === "gable" && profile === "asym";
+    const coupled = !isShed && system === "coupled";
+    const pL = isShed ? pitch : asym ? pitchL : pitch;
+    const pR = isShed ? pitch : asym ? pitchR : pitch;
+    const thL = (pL * Math.PI) / 180, thR = (pR * Math.PI) / 180;
+    const tL = Math.tan(thL), tR = Math.tan(thR);
+
+    let aL, aR, rise;
+    if (isShed) { aL = span; aR = 0; rise = span * tL; }
+    else { aL = (span * tR) / (tL + tR); aR = span - aL; rise = (span * tL * tR) / (tL + tR); }
+
+    const sL = muSnow(pL) * sk, sR = muSnow(pR) * sk;
+    const wL = (1.15 * G + 1.5 * sL) * spacing, wR = (1.15 * G + 1.5 * sR) * spacing;
+    const wLc = (G + sL) * spacing, wRc = (G + sR) * spacing;
+
+    let Ay, By, H = 0, Cy = 0, thrust = 0, tieForce = 0, ridgeReac = 0;
+    let RvL, RvR, M_L, V_L, N_L, M_R, V_R, N_R;
+
+    if (isShed) {
+      RvL = RvR = (wL * span) / 2;
+      M_L = (wL * span * span) / 8; V_L = (wL * span) / 2; N_L = RvL * Math.sin(thL);
+      M_R = 0; V_R = 0; N_R = 0;
+    } else {
+      const Wtot = wL * aL + wR * aR;
+      By = (wL * aL * (aL / 2) + wR * aR * (aL + aR / 2)) / span;
+      Ay = Wtot - By;
+      M_L = (wL * aL * aL) / 8; V_L = (wL * aL) / 2;
+      M_R = (wR * aR * aR) / 8; V_R = (wR * aR) / 2;
+      if (coupled) {
+        H = (Ay * aL - (wL * aL * aL) / 2) / rise;
+        Cy = wL * aL - Ay;
+        RvL = Ay; RvR = By;
+        if (tie === "none") thrust = Math.abs(H);
+        else if (tie === "plate") tieForce = Math.abs(H);
+        else { const hc = (collarPct / 100) * rise; tieForce = (Math.abs(H) * rise) / Math.max(rise - hc, 0.05); thrust = Math.abs(H); }
+      } else {
+        RvL = (wL * aL) / 2; RvR = (wR * aR) / 2;
+        ridgeReac = (wL * aL) / 2 + (wR * aR) / 2;
+      }
+      N_L = RvL * Math.sin(thL) + Math.abs(H) * Math.cos(thL);
+      N_R = RvR * Math.sin(thR) + Math.abs(H) * Math.cos(thR);
+    }
+
+    const act = isShed || active === "L"
+      ? { run: isShed ? span : aL, w: wL, wc: wLc, M: M_L, V: V_L, N: N_L, th: thL, S: sL, side: "L" }
+      : { run: aR, w: wR, wc: wRc, M: M_R, V: V_R, N: N_R, th: thR, S: sR, side: "R" };
+
+    const W = (b * h * h) / 6, I = (b * h * h * h) / 12, A = b * h;
+    const sigM = (act.M * 1e6) / W, tau = (1.5 * act.V * 1e3) / A, sigC = (Math.max(act.N, 0) * 1e3) / A;
+    const fmd = (kmod * g.fmk) / GAMMA_M, fvd = (kmod * g.fvk) / GAMMA_M, fcd = (kmod * g.fc0k) / GAMMA_M;
+    const Lmm = act.run * 1000;
+    const dInst = (5 * act.wc * Math.pow(Lmm, 4)) / (384 * g.E * I), dFinal = dInst * (1 + KDEF);
+    const combined = fcd > 0 ? sigC / fcd + sigM / fmd : sigM / fmd;
+
+    return { isShed, coupled, asym, aL, aR, rise, thL, thR, pL, pR, sL, sR, wL, wR,
+      Ay, By, H: Math.abs(H), Cy, thrust, tieForce, ridgeReac, RvL, RvR, M_L, M_R, V_L, V_R, N_L, N_R,
+      act, sigM, tau, sigC, fmd, fvd, fcd, combined, dInst, dFinal, limInst: Lmm / 300, limFinal: Lmm / 200 };
+  }, [roof, profile, system, tie, collarPct, active, span, pitch, pitchL, pitchR, spacing, G, sk, b, h, grade, dur]);
+
+  // diagram geometry
+  const VBW = 680, VBH = 430, cx = VBW / 2, plate = 350, ground = 392;
+  const scale = Math.min(430 / span, (plate - 48) / Math.max(r.rise, 0.01), 110);
+  const spanPx = span * scale, xL = cx - spanPx / 2, xR = cx + spanPx / 2;
+  const ridgeX = xL + r.aL * scale, ridgeY = plate - r.rise * scale;
+  const shedHigh = plate - r.rise * scale;
+  const fMax = Math.max(r.RvL, r.RvR, r.thrust, r.tieForce, r.ridgeReac, 0.001);
+  const fLen = (v) => 16 + Math.min(v / fMax, 1) * 40;
+
+  const loadArrows = (ax, ay, bx, by, w, key) => {
+    const arr = [];
+    for (const t of [0.3, 0.55, 0.8]) {
+      const px = lerp(ax, bx, t), py = lerp(ay, by, t);
+      arr.push(<Arrow key={key + t} x1={px} y1={py - 34} x2={px} y2={py - 5} color={C.load} width={1.8} />);
+    }
+    const mx = lerp(ax, bx, 0.5), my = lerp(ay, by, 0.5);
+    arr.push(<text key={key + "L"} x={mx} y={my - 38} fontSize={10.5} fill={C.load} textAnchor="middle">{f(w, 1)} kN/m</text>);
+    return arr;
+  };
+
+  // BMD / SFD for active rafter
+  const L = r.act.run, w = r.act.w, Vpk = (w * L) / 2, Mpk = (w * L * L) / 8;
+  const pw = 300, ph = 66, pad = 8;
+  const mPts = [];
+  for (let i = 0; i <= 24; i++) {
+    const x = (i / 24) * L, M = (w / 2) * x * (L - x);
+    mPts.push(`${pad + (x / L) * (pw - 2 * pad)},${pad + (M / (Mpk || 1)) * (ph - 2 * pad)}`);
+  }
+
+  return (
+    <div className="bg-white text-slate-900 p-4 sm:p-5 max-w-6xl mx-auto" style={{ fontFamily: "system-ui, sans-serif" }}>
+      <div className="mb-4">
+        <h1 className="text-xl font-semibold tracking-tight">Rafter load visualiser</h1>
+        <p className="text-sm text-slate-500 mt-0.5">Three-hinged idealisation · Eurocode 5 checks · live force paths in kN</p>
+      </div>
+
+      <div className="flex flex-wrap gap-x-5 gap-y-2 mb-4">
+        <div><div className="text-xs uppercase tracking-wide text-slate-400 mb-1">Roof</div>
+          <Seg options={[{ v: "shed", label: "Shed" }, { v: "gable", label: "Gable" }]} value={roof} onChange={setRoof} /></div>
+        {roof === "gable" && <div><div className="text-xs uppercase tracking-wide text-slate-400 mb-1">Profile</div>
+          <Seg options={[{ v: "sym", label: "Symmetric" }, { v: "asym", label: "Asymmetric" }]} value={profile} onChange={setProfile} /></div>}
+        {roof === "gable" && <div><div className="text-xs uppercase tracking-wide text-slate-400 mb-1">System</div>
+          <Seg options={[{ v: "coupled", label: "Coupled" }, { v: "ridge", label: "Ridge beam" }]} value={system} onChange={setSystem} /></div>}
+        {roof === "gable" && system === "coupled" && <div><div className="text-xs uppercase tracking-wide text-slate-400 mb-1">Tie</div>
+          <Seg options={[{ v: "none", label: "None" }, { v: "plate", label: "Plate" }, { v: "collar", label: "Collar" }]} value={tie} onChange={setTie} /></div>}
+      </div>
+
+      {/* diagram + sliders side by side */}
+      <div className="grid lg:grid-cols-[1fr_290px] gap-5 items-start">
+        <div className="rounded-xl border border-slate-200 bg-slate-50/50">
+          <svg viewBox={`0 0 ${VBW} ${VBH}`} className="w-full">
+            <line x1={26} y1={ground} x2={VBW - 26} y2={ground} stroke="#cbd5e1" strokeWidth={1.5} />
+            {Array.from({ length: 21 }).map((_, i) => (
+              <line key={i} x1={40 + i * 30} y1={ground} x2={30 + i * 30} y2={ground + 7} stroke="#cbd5e1" strokeWidth={1} />
+            ))}
+
+            {r.isShed ? (
+              <>
+                <rect x={xL - 6} y={plate} width={12} height={ground - plate} fill="#e2e8f0" stroke="#94a3b8" />
+                <rect x={xR - 6} y={shedHigh} width={12} height={ground - shedHigh} fill="#e2e8f0" stroke="#94a3b8" />
+                <line x1={xL} y1={plate} x2={xR} y2={shedHigh} stroke="#334155" strokeWidth={5} strokeLinecap="round" />
+                {loadArrows(xL, plate, xR, shedHigh, r.wL, "s")}
+                <Arrow x1={xL} y1={plate + fLen(r.RvL)} x2={xL} y2={plate + 4} color={C.react} />
+                <Arrow x1={xR} y1={shedHigh + fLen(r.RvR)} x2={xR} y2={shedHigh + 4} color={C.react} />
+                <text x={xL} y={plate + fLen(r.RvL) + 13} fontSize={10.5} fill={C.react} textAnchor="middle">{f(r.RvL)} kN</text>
+                <text x={xR} y={shedHigh + fLen(r.RvR) + 13} fontSize={10.5} fill={C.react} textAnchor="middle">{f(r.RvR)} kN</text>
+              </>
+            ) : (
+              <>
+                <rect x={xL - 6} y={plate} width={12} height={ground - plate} fill="#e2e8f0" stroke="#94a3b8" />
+                <rect x={xR - 6} y={plate} width={12} height={ground - plate} fill="#e2e8f0" stroke="#94a3b8" />
+                <line x1={xL} y1={plate} x2={ridgeX} y2={ridgeY} stroke="#334155" strokeWidth={5} strokeLinecap="round" />
+                <line x1={ridgeX} y1={ridgeY} x2={xR} y2={plate} stroke="#334155" strokeWidth={5} strokeLinecap="round" />
+                {loadArrows(xL, plate, ridgeX, ridgeY, r.wL, "l")}
+                {loadArrows(ridgeX, ridgeY, xR, plate, r.wR, "r")}
+
+                <Arrow x1={xL} y1={plate + fLen(r.RvL)} x2={xL} y2={plate + 4} color={C.react} />
+                <Arrow x1={xR} y1={plate + fLen(r.RvR)} x2={xR} y2={plate + 4} color={C.react} />
+                <text x={xL - 2} y={plate + fLen(r.RvL) + 13} fontSize={10.5} fill={C.react} textAnchor="middle">{f(r.RvL)} kN</text>
+                <text x={xR + 2} y={plate + fLen(r.RvR) + 13} fontSize={10.5} fill={C.react} textAnchor="middle">{f(r.RvR)} kN</text>
+
+                {system === "ridge" && (
+                  <>
+                    <polygon points={`${ridgeX},${ridgeY} ${ridgeX - 8},${ridgeY - 13} ${ridgeX + 8},${ridgeY - 13}`} fill="#94a3b8" />
+                    <Arrow x1={ridgeX} y1={ridgeY - 13 - fLen(r.ridgeReac)} x2={ridgeX} y2={ridgeY - 15} color={C.react} />
+                    <text x={ridgeX} y={ridgeY - 17 - fLen(r.ridgeReac)} fontSize={10.5} fill={C.react} textAnchor="middle">{f(r.ridgeReac)} kN</text>
+                  </>
+                )}
+                {system === "coupled" && Math.abs(r.Cy) > 0.05 && (
+                  <>
+                    <Arrow x1={ridgeX} y1={ridgeY} x2={ridgeX} y2={ridgeY - Math.sign(r.Cy) * fLen(Math.abs(r.Cy))} color={C.crown} width={1.8} />
+                    <text x={ridgeX + 10} y={ridgeY - 6} fontSize={10} fill={C.crown} textAnchor="start">crown {f(Math.abs(r.Cy))} kN</text>
+                  </>
+                )}
+                {r.thrust > 0.02 && (
+                  <>
+                    <Arrow x1={xL} y1={plate} x2={xL - fLen(r.thrust)} y2={plate} color={C.thrust} />
+                    <Arrow x1={xR} y1={plate} x2={xR + fLen(r.thrust)} y2={plate} color={C.thrust} />
+                    <text x={xL - fLen(r.thrust)} y={plate - 6} fontSize={10.5} fill={C.thrust} textAnchor="middle">{f(r.thrust)} kN</text>
+                    <text x={xR + fLen(r.thrust)} y={plate - 6} fontSize={10.5} fill={C.thrust} textAnchor="middle">{f(r.thrust)} kN</text>
+                  </>
+                )}
+                {system === "coupled" && tie !== "none" && (() => {
+                  const frac = tie === "collar" ? 1 - collarPct / 100 : 1;
+                  const tY = tie === "collar" ? plate - (collarPct / 100) * r.rise * scale : plate;
+                  const tx1 = lerp(ridgeX, xL, frac), tx2 = lerp(ridgeX, xR, frac);
+                  return (
+                    <g key="tie">
+                      <line x1={tx1} y1={tY} x2={tx2} y2={tY} stroke={C.tie} strokeWidth={4} strokeLinecap="round" />
+                      <Arrow x1={tx1 + 5} y1={tY} x2={tx1 + 5 + fLen(r.tieForce) * 0.55} y2={tY} color={C.tie} width={1.8} />
+                      <Arrow x1={tx2 - 5} y1={tY} x2={tx2 - 5 - fLen(r.tieForce) * 0.55} y2={tY} color={C.tie} width={1.8} />
+                      <text x={(tx1 + tx2) / 2} y={tY - 7} fontSize={10.5} fill={C.tie} textAnchor="middle">tie {f(r.tieForce)} kN</text>
+                    </g>
+                  );
+                })()}
+              </>
+            )}
+
+            {[["Load", C.load], ["Reaction", C.react], ["Thrust", C.thrust], ["Tie", C.tie], ["Crown", C.crown]].map(([t, col], i) => (
+              <g key={t} transform={`translate(${34 + i * 108}, 22)`}>
+                <rect width={10} height={10} rx={2} fill={col} />
+                <text x={15} y={9} fontSize={11.5} fill="#475569">{t}</text>
+              </g>
+            ))}
+          </svg>
+        </div>
+
+        <div className="space-y-3">
+          <Slider label="Building span (wall–wall)" value={span} set={setSpan} min={2} max={14} step={0.5} unit=" m" />
+          {r.isShed || profile === "sym" ? (
+            <Slider label="Pitch" value={pitch} set={setPitch} min={5} max={70} step={1} unit="°" />
+          ) : (
+            <>
+              <Slider label="Left pitch" value={pitchL} set={setPitchL} min={5} max={80} step={1} unit="°" />
+              <Slider label="Right pitch" value={pitchR} set={setPitchR} min={5} max={80} step={1} unit="°" />
+            </>
+          )}
+          <Slider label="Rafter spacing" value={spacing} set={setSpacing} min={0.3} max={1.2} step={0.05} unit=" m" />
+          {tie === "collar" && !r.isShed && system === "coupled" && (
+            <Slider label="Collar height (% of rise)" value={collarPct} set={setCollarPct} min={20} max={80} step={5} unit="%" />
+          )}
+          <div className="pt-1 border-t border-slate-100" />
+          <Slider label="Dead load G" value={G} set={setG} min={0.2} max={1.5} step={0.05} unit=" kN/m²" />
+          <Slider label="Ground snow sₖ" value={sk} set={setSk} min={1.5} max={5.5} step={0.1} unit=" kN/m²" />
+          <div className="text-xs text-slate-500 bg-slate-50 rounded-lg px-2.5 py-1.5 font-mono">
+            snow on roof → {r.isShed ? `${f(r.sL, 2)} kN/m²` : `L ${f(r.sL, 2)} · R ${f(r.sR, 2)} kN/m²`}
+            <span className="text-slate-400"> (μ from pitch)</span>
+          </div>
+        </div>
+      </div>
+
+      {/* stats */}
+      <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 mt-4">
+        <Stat label="Rise" value={f(r.rise, 2)} unit="m" />
+        {!r.isShed && <Stat label="Ridge from left" value={f(r.aL, 2)} unit="m" />}
+        <Stat label="Left reaction" value={f(r.RvL)} unit="kN" color={C.react} />
+        {!r.isShed && <Stat label="Right reaction" value={f(r.RvR)} unit="kN" color={C.react} />}
+        {r.H > 0.02 && <Stat label="Thrust H" value={f(r.H)} unit="kN" color={C.thrust} />}
+        {r.tieForce > 0.02 && <Stat label="Tie tension" value={f(r.tieForce)} unit="kN" color={C.tie} />}
+        {r.ridgeReac > 0.02 && <Stat label="Ridge reaction" value={f(r.ridgeReac)} unit="kN" color={C.react} />}
+        {!r.isShed && Math.abs(r.Cy) > 0.05 && <Stat label="Crown shear" value={f(Math.abs(r.Cy))} unit="kN" color={C.crown} />}
+        <Stat label={`Axial ${r.act.side}`} value={f(r.act.N)} unit="kN" />
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-5 mt-4">
+        {/* checks */}
+        <div className="rounded-xl border border-slate-200 p-4">
+          <div className="flex justify-between items-center mb-1">
+            <div className="text-sm font-medium text-slate-700">Section checks</div>
+            {!r.isShed && (
+              <Seg options={[{ v: "L", label: "Left rafter" }, { v: "R", label: "Right rafter" }]} value={active} onChange={setActive} />
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <label className="text-xs text-slate-600">Width b
+              <input type="number" value={b} onChange={(e) => setB(parseFloat(e.target.value) || 0)}
+                className="mt-0.5 w-full rounded-md border border-slate-200 px-2 py-1 font-mono text-sm focus:border-blue-500 focus:outline-none" /></label>
+            <label className="text-xs text-slate-600">Depth h
+              <input type="number" value={h} onChange={(e) => setH(parseFloat(e.target.value) || 0)}
+                className="mt-0.5 w-full rounded-md border border-slate-200 px-2 py-1 font-mono text-sm focus:border-blue-500 focus:outline-none" /></label>
+            <label className="text-xs text-slate-600">Grade
+              <select value={grade} onChange={(e) => setGrade(e.target.value)}
+                className="mt-0.5 w-full rounded-md border border-slate-200 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none">
+                {Object.keys(GRADES).map((k) => <option key={k}>{k}</option>)}</select></label>
+            <label className="text-xs text-slate-600">Duration
+              <select value={dur} onChange={(e) => setDur(e.target.value)}
+                className="mt-0.5 w-full rounded-md border border-slate-200 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none">
+                {Object.keys(DURATION).map((k) => <option key={k}>{k}</option>)}</select></label>
+          </div>
+          <CheckRow label="Bending σ_m" demand={r.sigM} capacity={r.fmd} unit="N/mm²" />
+          <CheckRow label="Shear τ" demand={r.tau} capacity={r.fvd} unit="N/mm²" />
+          {r.sigC > 0.01 && <CheckRow label="Axial σ_c" demand={r.sigC} capacity={r.fcd} unit="N/mm²" />}
+          {r.coupled && <CheckRow label="Combined N+M" demand={r.combined} capacity={1} unit="" />}
+          <CheckRow label="Deflection inst. (L/300)" demand={r.dInst} capacity={r.limInst} unit="mm" />
+          <CheckRow label="Deflection final (L/200)" demand={r.dFinal} capacity={r.limFinal} unit="mm" />
+        </div>
+
+        {/* BMD + SFD */}
+        <div className="rounded-xl border border-slate-200 p-4">
+          <div className="text-sm font-medium text-slate-700 mb-2">
+            {r.isShed ? "Rafter" : active === "L" ? "Left rafter" : "Right rafter"} · run {f(L, 2)} m · w {f(w, 2)} kN/m
+          </div>
+          <div className="text-xs text-slate-500 mb-1">Shear force (kN)</div>
+          <svg viewBox={`0 0 ${pw} ${ph}`} className="w-full mb-3">
+            <line x1={pad} y1={ph / 2} x2={pw - pad} y2={ph / 2} stroke="#cbd5e1" strokeWidth={1} />
+            <line x1={pad} y1={ph / 2 - (ph / 2 - pad)} x2={pw - pad} y2={ph / 2 + (ph / 2 - pad)} stroke={C.thrust} strokeWidth={2} />
+            <text x={pad + 2} y={pad + 4} fontSize={10} fill={C.thrust}>+{f(Vpk)}</text>
+            <text x={pw - pad - 2} y={ph - pad} fontSize={10} fill={C.thrust} textAnchor="end">−{f(Vpk)}</text>
+          </svg>
+          <div className="text-xs text-slate-500 mb-1">Bending moment (kNm)</div>
+          <svg viewBox={`0 0 ${pw} ${ph}`} className="w-full">
+            <line x1={pad} y1={pad} x2={pw - pad} y2={pad} stroke="#cbd5e1" strokeWidth={1} />
+            <polyline points={mPts.join(" ")} fill="none" stroke={C.load} strokeWidth={2} />
+            <text x={pw / 2} y={ph - 3} fontSize={10} fill={C.load} textAnchor="middle">M_max {f(Mpk, 2)} kNm</text>
+          </svg>
+        </div>
+      </div>
+
+      <div className="mt-4 text-xs text-slate-400 leading-relaxed">
+        Coupled thrust H = wL/(2(tanθ_L+tanθ_R)) from the three-hinged model; vertical reactions from global equilibrium;
+        crown shear = w·a_L − R_left (zero only when symmetric). Per-rafter M = w·run²/8 (simply-supported, conservative — arch
+        action reduces it). Snow s = μ₁·sₖ, μ₁ = 0.8 (≤30°) ramping to 0 at 60°. ULS = 1.15G + 1.5S, γ_M = 1.4, service class 2.
+        Educational tool — not a stamped design.
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<RafterCalculator />);
+</script>
+</body>
+</html>
